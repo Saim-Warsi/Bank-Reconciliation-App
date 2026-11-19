@@ -44,11 +44,12 @@ def init_db():
           created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS companies(
           id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, currency TEXT NOT NULL DEFAULT 'PKR',
-          created_at TEXT NOT NULL);
+          created_at TEXT NOT NULL, deleted_at TEXT DEFAULT NULL);
         CREATE TABLE IF NOT EXISTS accounts(
           id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL, bank_name TEXT NOT NULL,
           account_title TEXT NOT NULL, account_number TEXT NOT NULL, gl_code TEXT DEFAULT '',
           opening_bank REAL DEFAULT 0, opening_book REAL DEFAULT 0, active INTEGER DEFAULT 1,
+          deleted_at TEXT DEFAULT NULL,
           FOREIGN KEY(company_id) REFERENCES companies(id));
         CREATE TABLE IF NOT EXISTS transactions(
           id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
@@ -56,17 +57,35 @@ def init_db():
           txn_date TEXT NOT NULL, description TEXT DEFAULT '', reference TEXT DEFAULT '',
           debit REAL DEFAULT 0, credit REAL DEFAULT 0, amount REAL NOT NULL,
           fingerprint TEXT, match_group TEXT, status TEXT DEFAULT 'Unmatched',
-          source_file TEXT DEFAULT '', imported_at TEXT NOT NULL,
+          source_file TEXT DEFAULT '', imported_at TEXT NOT NULL, deleted_at TEXT DEFAULT NULL,
           FOREIGN KEY(company_id) REFERENCES companies(id),
           FOREIGN KEY(account_id) REFERENCES accounts(id));
         CREATE UNIQUE INDEX IF NOT EXISTS ux_txn_fingerprint ON transactions(fingerprint) WHERE fingerprint IS NOT NULL;
         CREATE TABLE IF NOT EXISTS reconciliation_runs(
           id INTEGER PRIMARY KEY, company_id INTEGER, account_id INTEGER, period_start TEXT,
           period_end TEXT, bank_closing REAL, book_closing REAL, brs_adjusted REAL,
-          status TEXT DEFAULT 'Draft', created_by TEXT, created_at TEXT);
+          status TEXT DEFAULT 'Draft', created_by TEXT, created_at TEXT, deleted_at TEXT DEFAULT NULL,
+          updated_at TEXT DEFAULT NULL, updated_by TEXT DEFAULT NULL);
         CREATE TABLE IF NOT EXISTS audit_log(
           id INTEGER PRIMARY KEY, username TEXT, action TEXT, detail TEXT, created_at TEXT);
                 """)
+
+        # Backward-compatible migrations for existing databases.
+        migrations = {
+            "companies": {"deleted_at": "TEXT DEFAULT NULL"},
+            "accounts": {"deleted_at": "TEXT DEFAULT NULL"},
+            "transactions": {"deleted_at": "TEXT DEFAULT NULL"},
+            "reconciliation_runs": {
+                "deleted_at": "TEXT DEFAULT NULL",
+                "updated_at": "TEXT DEFAULT NULL",
+                "updated_by": "TEXT DEFAULT NULL",
+            },
+        }
+        for table, wanted in migrations.items():
+            existing = {r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+            for column, definition in wanted.items():
+                if column not in existing:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
         # Automatically upgrade older databases
         columns = [
@@ -97,12 +116,12 @@ def qdf(sql, params=()):
 
 def company_options():
     d = qdf(
-        "SELECT id, name, currency FROM companies ORDER BY name"
+        "SELECT id, name, currency FROM companies WHERE deleted_at IS NULL ORDER BY name"
     )
     return d
 
 def account_options(company_id):
-    return qdf("SELECT * FROM accounts WHERE company_id=? AND active=1 ORDER BY bank_name,account_title", (int(company_id),))
+    return qdf("SELECT * FROM accounts WHERE company_id=? AND active=1 AND deleted_at IS NULL ORDER BY bank_name,account_title", (int(company_id),))
 
 def money(v, currency="PKR"):
     return f"{currency} {float(v or 0):,.2f}"
@@ -172,7 +191,95 @@ def import_transactions(d, company_id, account_id, source, filename, username):
     return count
 
 def transactions(company_id, account_id):
-    return qdf("SELECT * FROM transactions WHERE company_id=? AND account_id=? ORDER BY txn_date,id",(company_id,account_id))
+    return qdf("SELECT * FROM transactions WHERE company_id=? AND account_id=? AND deleted_at IS NULL ORDER BY txn_date,id",(company_id,account_id))
+
+
+def update_transaction(txn_id, txn_date, description, reference, debit, credit, username):
+    debit, credit = float(debit), float(credit)
+    if debit < 0 or credit < 0 or (debit > 0 and credit > 0):
+        raise ValueError("Enter either a non-negative debit or a non-negative credit, not both.")
+    amount = credit - debit
+    with connect() as c:
+        row = c.execute(
+            "SELECT * FROM transactions WHERE id=? AND deleted_at IS NULL", (int(txn_id),)
+        ).fetchone()
+        if not row:
+            raise ValueError("Transaction not found.")
+        if row["status"] == "Matched":
+            raise ValueError("Undo its match group before editing this transaction.")
+        c.execute("""UPDATE transactions
+                     SET txn_date=?, description=?, reference=?, debit=?, credit=?, amount=?,
+                         fingerprint=NULL
+                     WHERE id=?""",
+                  (txn_date.isoformat() if hasattr(txn_date, "isoformat") else str(txn_date),
+                   description.strip(), reference.strip(), debit, credit, amount, int(txn_id)))
+    audit(username, "UPDATE TRANSACTION",
+          f"Transaction #{txn_id}; date={txn_date}; description={description}; reference={reference}; debit={debit}; credit={credit}")
+
+def soft_delete_transaction(txn_id, username):
+    with connect() as c:
+        row = c.execute(
+            "SELECT id, status, match_group FROM transactions WHERE id=? AND deleted_at IS NULL",
+            (int(txn_id),)
+        ).fetchone()
+        if not row:
+            raise ValueError("Transaction not found.")
+        if row["status"] == "Matched":
+            raise ValueError("Undo the match group before deleting this transaction.")
+        c.execute("UPDATE transactions SET deleted_at=? WHERE id=?",
+                  (datetime.now().isoformat(timespec="seconds"), int(txn_id)))
+    audit(username, "TRASH TRANSACTION", f"Transaction #{txn_id} moved to Recycle Bin.")
+
+def restore_transaction(txn_id, username):
+    with connect() as c:
+        row = c.execute("SELECT id FROM transactions WHERE id=? AND deleted_at IS NOT NULL",
+                        (int(txn_id),)).fetchone()
+        if not row:
+            raise ValueError("Deleted transaction not found.")
+        c.execute("UPDATE transactions SET deleted_at=NULL WHERE id=?", (int(txn_id),))
+    audit(username, "RESTORE TRANSACTION", f"Transaction #{txn_id} restored.")
+
+def update_brs(run_id, period_start, period_end, bank_closing, book_closing, username):
+    if period_start > period_end:
+        raise ValueError("Period start must not be after period end.")
+    with connect() as c:
+        row = c.execute("SELECT status FROM reconciliation_runs WHERE id=? AND deleted_at IS NULL",
+                        (int(run_id),)).fetchone()
+        if not row:
+            raise ValueError("Reconciliation run not found.")
+        if row["status"] != "Draft":
+            raise ValueError("Only Draft reconciliation runs can be edited.")
+        run_account = c.execute(
+            "SELECT company_id, account_id FROM reconciliation_runs WHERE id=?", (int(run_id),)
+        ).fetchone()
+        txns = c.execute("""SELECT source, amount FROM transactions
+                            WHERE company_id=? AND account_id=? AND deleted_at IS NULL
+                              AND status='Unmatched' AND txn_date BETWEEN ? AND ?""",
+                         (run_account["company_id"], run_account["account_id"],
+                          period_start.isoformat(), period_end.isoformat())).fetchall()
+        bank_credits = sum(r["amount"] for r in txns if r["source"] == "Bank" and r["amount"] > 0)
+        bank_debits = sum(r["amount"] for r in txns if r["source"] == "Bank" and r["amount"] < 0)
+        adjusted_book = float(book_closing + bank_credits + bank_debits)
+        c.execute("""UPDATE reconciliation_runs
+                     SET period_start=?, period_end=?, bank_closing=?, book_closing=?, brs_adjusted=?,
+                         updated_at=?, updated_by=?
+                     WHERE id=?""",
+                  (period_start.isoformat(), period_end.isoformat(), float(bank_closing),
+                   float(book_closing), adjusted_book, datetime.now().isoformat(timespec="seconds"),
+                   username, int(run_id)))
+    audit(username, "UPDATE BRS DRAFT", f"Reconciliation run #{run_id} updated.")
+
+def soft_delete_brs(run_id, username):
+    with connect() as c:
+        row = c.execute("SELECT status FROM reconciliation_runs WHERE id=? AND deleted_at IS NULL",
+                        (int(run_id),)).fetchone()
+        if not row:
+            raise ValueError("Reconciliation run not found.")
+        if row["status"] != "Draft":
+            raise ValueError("Only Draft reconciliation runs can be moved to the Recycle Bin.")
+        c.execute("UPDATE reconciliation_runs SET deleted_at=? WHERE id=?",
+                  (datetime.now().isoformat(timespec="seconds"), int(run_id)))
+    audit(username, "TRASH BRS DRAFT", f"Reconciliation run #{run_id} moved to Recycle Bin.")
 
 def match_group(ids, username, label="Manual match"):
     ids=[int(x) for x in ids]
@@ -293,7 +400,7 @@ st.sidebar.button("Log out",on_click=lambda: st.session_state.pop("user",None))
 st.title("Bank Reconciliation Pro")
 st.caption("Multi-company • Multi-bank • Split/combined matching • Formal BRS • Audit trail")
 if ac.empty: st.stop()
-tabs=st.tabs(["Dashboard","Companies & Accounts","Import","Reconciliation","Manual Match & Adjustments","BRS & Reports","Users & Audit","Backup & Restore"])
+tabs=st.tabs(["Dashboard","Companies & Accounts","Import","Reconciliation","Manual Match & Adjustments","BRS & Reports","Data Management","Users & Audit","Backup & Restore"])
 
 with tabs[0]:
     df=transactions(company_id,account_id)
@@ -346,6 +453,58 @@ with tabs[1]:
              VALUES(?,?,?,?,?,?,?)""",(cid,bank_name,title,number,gl,ob,ol))
             audit(USER["username"],"CREATE BANK ACCOUNT",f"{co_name}: {bank_name} {title}")
             st.success("Account added. Refresh the page.")
+
+
+    if role == "Admin":
+        st.divider()
+        st.subheader("Edit company")
+        companies_edit = company_options()
+        if not companies_edit.empty:
+            edit_company_name = st.selectbox("Company to edit", companies_edit.name.tolist(), key="edit_company_select")
+            edit_company = companies_edit[companies_edit.name == edit_company_name].iloc[0]
+            with st.form("edit_company_form"):
+                revised_company_name = st.text_input("Company name", value=str(edit_company.name))
+                revised_currency = st.selectbox("Currency", ["PKR","USD","AED","GBP","EUR"],
+                                                 index=["PKR","USD","AED","GBP","EUR"].index(edit_company.currency))
+                save_company = st.form_submit_button("Update company")
+            if save_company:
+                try:
+                    with connect() as c:
+                        c.execute("UPDATE companies SET name=?,currency=? WHERE id=?",
+                                  (revised_company_name.strip(), revised_currency, int(edit_company.id)))
+                    audit(USER["username"], "UPDATE COMPANY", f"Company #{int(edit_company.id)} updated.")
+                    st.success("Company updated.")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("That company name is already in use.")
+
+        st.subheader("Edit bank account")
+        all_accounts = qdf("SELECT * FROM accounts WHERE company_id=? AND deleted_at IS NULL ORDER BY id",
+                           (company_id,))
+        if not all_accounts.empty:
+            account_choice = st.selectbox("Account to edit",
+                all_accounts.apply(lambda r: f"#{r.id} · {r.bank_name} — {r.account_title}", axis=1).tolist(),
+                key="edit_account_choice")
+            account_row = all_accounts.iloc[all_accounts.apply(
+                lambda r: f"#{r.id} · {r.bank_name} — {r.account_title}", axis=1).tolist().index(account_choice)]
+            with st.form("edit_account_form"):
+                revised_bank = st.text_input("Bank name", value=str(account_row.bank_name))
+                revised_title = st.text_input("Account title", value=str(account_row.account_title))
+                revised_number = st.text_input("Account number", value=str(account_row.account_number))
+                revised_gl = st.text_input("GL code", value=str(account_row.gl_code or ""))
+                revised_open_bank = st.number_input("Opening bank balance", value=float(account_row.opening_bank or 0))
+                revised_open_book = st.number_input("Opening book balance", value=float(account_row.opening_book or 0))
+                revised_active = st.checkbox("Account active", value=bool(account_row.active))
+                save_account = st.form_submit_button("Update bank account")
+            if save_account:
+                with connect() as c:
+                    c.execute("""UPDATE accounts SET bank_name=?,account_title=?,account_number=?,gl_code=?,
+                                 opening_bank=?,opening_book=?,active=? WHERE id=?""",
+                              (revised_bank.strip(), revised_title.strip(), revised_number.strip(), revised_gl.strip(),
+                               revised_open_bank, revised_open_book, int(revised_active), int(account_row.id)))
+                audit(USER["username"], "UPDATE BANK ACCOUNT", f"Account #{int(account_row.id)} updated.")
+                st.success("Bank account updated.")
+                st.rerun()
 
 with tabs[2]:
     st.subheader("Import statements")
@@ -485,9 +644,125 @@ with tabs[5]:
         excel=make_excel(df,detail)
         st.download_button("Download Excel reconciliation workbook",excel,"bank_reconciliation_workbook.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.subheader("Previous BRS runs")
-    st.dataframe(qdf("SELECT id,period_start,period_end,bank_closing,book_closing,brs_adjusted,status,created_by,created_at FROM reconciliation_runs WHERE company_id=? AND account_id=? ORDER BY id DESC",(company_id,account_id)),use_container_width=True)
+    st.dataframe(qdf("SELECT id,period_start,period_end,bank_closing,book_closing,brs_adjusted,status,created_by,created_at FROM reconciliation_runs WHERE company_id=? AND account_id=? AND deleted_at IS NULL ORDER BY id DESC",(company_id,account_id)),use_container_width=True)
+
 
 with tabs[6]:
+    st.subheader("Transaction management")
+    st.caption("Edit or move incorrect unmatched entries to the Recycle Bin. Matched entries must first be unmatched.")
+    manage_df = transactions(company_id, account_id)
+    if manage_df.empty:
+        st.info("There are no active transactions for this account.")
+    else:
+        source_filter = st.selectbox("Filter source", ["All", "Bank", "Books", "Adjustment"], key="crud_source")
+        status_filter = st.selectbox("Filter status", ["All", "Unmatched", "Matched"], key="crud_status")
+        search_text = st.text_input("Search description or reference", key="crud_search")
+        view_df = manage_df.copy()
+        if source_filter != "All":
+            view_df = view_df[view_df.source == source_filter]
+        if status_filter != "All":
+            view_df = view_df[view_df.status == status_filter]
+        if search_text.strip():
+            mask = (view_df.description.fillna("").str.contains(search_text, case=False, na=False) |
+                    view_df.reference.fillna("").str.contains(search_text, case=False, na=False))
+            view_df = view_df[mask]
+        st.dataframe(view_df[["id","source","txn_date","description","reference","debit","credit","amount","status","match_group"]],
+                     use_container_width=True, hide_index=True)
+        if not view_df.empty:
+            selected_id = st.selectbox("Select transaction to edit or delete",
+                                       view_df.id.astype(int).tolist(), key="crud_txn_id")
+            selected_row = manage_df[manage_df.id == selected_id].iloc[0]
+            st.markdown(f"**Selected:** #{selected_id} · {selected_row.source} · {selected_row.status}")
+            if selected_row.status == "Matched":
+                st.warning("This transaction belongs to a match group. Undo that group in Manual Match & Adjustments before editing or deleting.")
+            with st.form("edit_transaction_form"):
+                edit_date = st.date_input("Transaction date", value=pd.to_datetime(selected_row.txn_date).date())
+                edit_desc = st.text_input("Description", value=str(selected_row.description or ""))
+                edit_ref = st.text_input("Reference", value=str(selected_row.reference or ""))
+                edit_debit = st.number_input("Debit", min_value=0.0, value=float(selected_row.debit or 0), format="%.2f")
+                edit_credit = st.number_input("Credit", min_value=0.0, value=float(selected_row.credit or 0), format="%.2f")
+                save_txn = st.form_submit_button("Save transaction changes",
+                                                 disabled=(role == "Viewer" or selected_row.status == "Matched"))
+            if save_txn:
+                try:
+                    update_transaction(selected_id, edit_date, edit_desc, edit_ref,
+                                       edit_debit, edit_credit, USER["username"])
+                    st.success("Transaction updated.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+            with st.form("trash_transaction_form"):
+                confirm_trash = st.checkbox(f"Move transaction #{selected_id} to Recycle Bin")
+                trash_txn = st.form_submit_button("Move to Recycle Bin",
+                                                  disabled=(role == "Viewer" or selected_row.status == "Matched"))
+            if trash_txn and confirm_trash:
+                try:
+                    soft_delete_transaction(selected_id, USER["username"])
+                    st.success("Transaction moved to Recycle Bin.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+    st.divider()
+    st.subheader("Recycle Bin")
+    st.caption("Deleted transactions are retained in the database and can be restored by an Admin.")
+    if role == "Admin":
+        trash_df = qdf("""SELECT id,source,txn_date,description,reference,debit,credit,amount,deleted_at
+                          FROM transactions WHERE company_id=? AND account_id=? AND deleted_at IS NOT NULL
+                          ORDER BY deleted_at DESC""", (company_id, account_id))
+        if trash_df.empty:
+            st.info("Recycle Bin is empty for this account.")
+        else:
+            st.dataframe(trash_df, use_container_width=True, hide_index=True)
+            restore_id = st.selectbox("Select deleted transaction to restore",
+                                      trash_df.id.astype(int).tolist(), key="restore_txn_id")
+            if st.button("Restore selected transaction", type="primary"):
+                try:
+                    restore_transaction(restore_id, USER["username"])
+                    st.success("Transaction restored.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+    else:
+        st.info("Only Admin users can restore deleted transactions.")
+
+    st.divider()
+    st.subheader("Reconciliation draft management")
+    runs = qdf("""SELECT id,period_start,period_end,bank_closing,book_closing,status,created_by,created_at
+                  FROM reconciliation_runs WHERE company_id=? AND account_id=? AND deleted_at IS NULL
+                  ORDER BY id DESC""", (company_id, account_id))
+    st.dataframe(runs, use_container_width=True, hide_index=True)
+    drafts = runs[runs.status == "Draft"] if not runs.empty else runs
+    if not drafts.empty and role != "Viewer":
+        run_id = st.selectbox("Select Draft BRS to modify", drafts.id.astype(int).tolist(), key="edit_brs_id")
+        run = drafts[drafts.id == run_id].iloc[0]
+        with st.form("edit_brs_form"):
+            new_start = st.date_input("Period start", value=pd.to_datetime(run.period_start).date(), key="edit_brs_start")
+            new_end = st.date_input("Period end", value=pd.to_datetime(run.period_end).date(), key="edit_brs_end")
+            new_bank = st.number_input("Bank closing balance", value=float(run.bank_closing or 0), key="edit_brs_bank")
+            new_books = st.number_input("Book closing balance", value=float(run.book_closing or 0), key="edit_brs_books")
+            save_brs = st.form_submit_button("Update Draft BRS")
+        if save_brs:
+            try:
+                update_brs(run_id, new_start, new_end, new_bank, new_books, USER["username"])
+                st.success("Draft BRS updated. Generate a fresh report from BRS & Reports to recalculate.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+        with st.form("trash_brs_form"):
+            confirm_brs = st.checkbox(f"Move Draft BRS #{run_id} to Recycle Bin")
+            delete_brs = st.form_submit_button("Move Draft BRS to Recycle Bin")
+        if delete_brs and confirm_brs:
+            try:
+                soft_delete_brs(run_id, USER["username"])
+                st.success("Draft BRS moved to Recycle Bin.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+    elif role == "Viewer":
+        st.info("View-only access.")
+
+with tabs[7]:
     st.subheader("User accounts and permissions")
     if role=="Admin":
         with st.form("new_user"):
@@ -509,7 +784,7 @@ with tabs[6]:
             target=st.selectbox("User",users.username.tolist())
             target_row=users[users.username==target].iloc[0]
             new_role=st.selectbox("New role",["Admin","Accountant","Viewer"],index=["Admin","Accountant","Viewer"].index(target_row.role))
-            active=st.checkbox("Account active",value=bool(target_row.active))
+            active=st.checkbox("Account active (uncheck to deactivate)",value=bool(target_row.active))
             if st.button("Update user"):
                 if target==USER["username"] and (not active or new_role!="Admin"): st.error("You cannot deactivate or demote your own active administrator session.")
                 else:
@@ -532,7 +807,7 @@ with tabs[6]:
     st.dataframe(logs,use_container_width=True,hide_index=True)
     st.download_button("Export audit log CSV",logs.to_csv(index=False).encode("utf-8-sig"),"audit_log.csv","text/csv")
 
-with tabs[7]:
+with tabs[8]:
     st.subheader("Database backup and restore")
     st.write("Backup includes companies, accounts, transactions, user accounts, reconciliation runs and audit history.")
     if role=="Admin":
