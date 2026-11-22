@@ -11,12 +11,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 DB_PATH = Path("reconciliation.db")
 st.set_page_config(page_title="Bank Reconciliation Pro", page_icon="🏦", layout="wide")
 
-# ---------------------------------------------------------------------------
-# MongoDB persistence
-# The app works on a local SQLite file. Every committed change is copied to MongoDB
-# (GridFS), and if the server restarts and the local file is gone, the latest copy is
-# restored from MongoDB. Set MONGODB_URI in Streamlit Secrets (or as an environment variable).
-# ---------------------------------------------------------------------------
+
 SYNC_STATE = {"enabled": False, "last_error": None}
 
 @st.cache_resource(show_spinner=False)
