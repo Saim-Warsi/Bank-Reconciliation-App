@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import sqlite3, hashlib, secrets, json, shutil, io, zipfile
@@ -281,22 +280,42 @@ def soft_delete_brs(run_id, username):
                   (datetime.now().isoformat(timespec="seconds"), int(run_id)))
     audit(username, "TRASH BRS DRAFT", f"Reconciliation run #{run_id} moved to Recycle Bin.")
 
-def match_group(ids, username, label="Manual match"):
+def match_group(ids, username, label="Manual match", balancing=None):
+    """Match bank and book entries that offset to zero.
+
+    balancing: optional dict(date, description, reference). When the selected entries
+    do not net to zero, an Adjustment entry for the exact residual is created and matched
+    in the same database transaction, so the group always balances and stays auditable.
+    """
     ids=[int(x) for x in ids]
     if len(ids)<2: raise ValueError("Select at least two entries.")
     with connect() as c:
         marks=",".join("?"*len(ids))
-        rows=c.execute(f"SELECT id,source,amount,status FROM transactions WHERE id IN ({marks})",ids).fetchall()
+        rows=c.execute(f"SELECT id,company_id,account_id,source,amount,status FROM transactions WHERE id IN ({marks})",ids).fetchall()
         if len(rows)!=len(ids): raise ValueError("One or more selected transactions do not exist.")
         if any(r["status"]=="Matched" for r in rows): raise ValueError("A selected transaction is already matched.")
         sources={r["source"] for r in rows}
         if "Bank" not in sources or not ({"Books","Adjustment"} & sources):
             raise ValueError("A match must include at least one Bank entry and at least one Books/Adjustment entry.")
-        total=sum(r["amount"] for r in rows)
-        if abs(total)>0.01: raise ValueError(f"Selected entries do not balance. Net difference: {total:,.2f}")
+        total=round(sum(r["amount"] for r in rows),2)
         gid="R-"+secrets.token_hex(5).upper()
+        adj_id=None
+        if abs(total)>0.01:
+            if not balancing or not str(balancing.get("description","")).strip():
+                raise ValueError(f"Selected entries do not balance. Net difference: {total:,.2f}. "
+                                 "Post a balancing entry with a description, or correct the entries.")
+            amt=-total   # the adjustment offsets the residual exactly
+            cur=c.execute("""INSERT INTO transactions(company_id,account_id,source,txn_date,description,reference,
+                              debit,credit,amount,status,match_group,imported_at)
+                             VALUES(?,?,'Adjustment',?,?,?,?,?,?,'Matched',?,?)""",
+                          (rows[0]["company_id"],rows[0]["account_id"],balancing["date"],
+                           balancing["description"].strip(),str(balancing.get("reference","")).strip(),
+                           max(-amt,0),max(amt,0),amt,gid,datetime.now().isoformat(timespec="seconds")))
+            adj_id=cur.lastrowid
         c.execute(f"UPDATE transactions SET match_group=?,status='Matched' WHERE id IN ({marks})",[gid]+ids)
-    audit(username,label,f"Group {gid}; transaction IDs={ids}")
+    detail=f"Group {gid}; transaction IDs={ids}"
+    if adj_id: detail+=f"; balancing adjustment #{adj_id} amount={-total:,.2f}"
+    audit(username,label,detail)
     return gid
 
 def automatic_match(df, date_days, amount_tolerance, username):
@@ -544,10 +563,41 @@ with tabs[4]:
     if not open_df.empty:
         options=open_df.apply(lambda r:f"#{r.id} | {r.source} | {r.txn_date} | {r.description[:40]} | {r.amount:,.2f}",axis=1).tolist()
         selected=st.multiselect("Select entries that offset to zero (one bank entry may match multiple book entries)",options)
+        ids=[int(x.split("|")[0].replace("#","").strip()) for x in selected]
+        sel=open_df[open_df.id.isin(ids)]
+        bank_total=float(sel[sel.source=="Bank"].amount.sum())
+        book_total=float(sel[sel.source!="Bank"].amount.sum())
+        net=round(bank_total+book_total,2)
+        balancing=None
+        if ids:
+            m1,m2,m3=st.columns(3)
+            m1.metric("Bank entries total",f"{bank_total:,.2f}")
+            m2.metric("Book entries total",f"{book_total:,.2f}")
+            m3.metric("Net difference",f"{net:,.2f}")
+            if abs(net)<=0.01:
+                st.success("Bank and book entries balance.")
+            else:
+                st.warning(f"Selected entries do not balance. Net difference: {net:,.2f}")
+                # Detect a probable inverted sign: flipping one entry would nearly close the gap.
+                scale=max(abs(bank_total),abs(book_total),1.0)
+                for r in sel.itertuples():
+                    flipped=round(net-2*float(r.amount),2)
+                    if abs(flipped)<abs(net)/2 and abs(flipped)<=0.01*scale:
+                        st.info(f"Entry #{r.id} ({r.amount:,.2f}) may have an inverted sign. With its sign reversed the "
+                                f"difference would be only {flipped:,.2f}. If so, correct it in Data Management; "
+                                "otherwise post a balancing entry below for the true residual.")
+                if role in ("Admin","Accountant"):
+                    if st.checkbox(f"Post a manual balancing entry of {-net:,.2f} to close the difference",key="bal_on"):
+                        bdate=st.date_input("Balancing entry date",value=date.today(),key="bal_date")
+                        bdesc=st.text_input("Reason / description (required)",key="bal_desc",
+                                            placeholder="e.g. Bank charges, rounding, timing difference")
+                        bref=st.text_input("Reference",key="bal_ref")
+                        balancing={"date":bdate.isoformat(),"description":bdesc,"reference":bref}
+                else:
+                    st.info("Your role cannot post balancing entries.")
         if st.button("Confirm manual match",disabled=(role=="Viewer")):
-            ids=[int(x.split("|")[0].replace("#","").strip()) for x in selected]
             try:
-                gid=match_group(ids,USER["username"])
+                gid=match_group(ids,USER["username"],balancing=balancing)
                 st.success(f"Matched group {gid} created."); st.rerun()
             except Exception as e: st.error(str(e))
     else: st.info("No unmatched entries.")
