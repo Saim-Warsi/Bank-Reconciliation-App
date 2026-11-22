@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import sqlite3, hashlib, secrets, json, shutil, io, zipfile
+import sqlite3, hashlib, secrets, json, shutil, io, zipfile, os, tempfile, threading
 from pathlib import Path
 from datetime import datetime, date
 from reportlab.lib.pagesizes import A4, landscape
@@ -11,8 +11,96 @@ from reportlab.lib.styles import getSampleStyleSheet
 DB_PATH = Path("reconciliation.db")
 st.set_page_config(page_title="Bank Reconciliation Pro", page_icon="🏦", layout="wide")
 
+# ---------------------------------------------------------------------------
+# MongoDB persistence
+# The app works on a local SQLite file. Every committed change is copied to MongoDB
+# (GridFS), and if the server restarts and the local file is gone, the latest copy is
+# restored from MongoDB. Set MONGODB_URI in Streamlit Secrets (or as an environment variable).
+# ---------------------------------------------------------------------------
+SYNC_STATE = {"enabled": False, "last_error": None}
+
+@st.cache_resource(show_spinner=False)
+def _sync_lock():
+    return threading.Lock()
+
+@st.cache_resource(show_spinner=False)
+def _mongo_db():
+    uri = None
+    try:
+        uri = st.secrets.get("MONGODB_URI")
+    except Exception:
+        pass
+    uri = uri or os.environ.get("MONGODB_URI")
+    if not uri:
+        return None
+    from pymongo import MongoClient
+    client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+    client.admin.command("ping")
+    name = None
+    try:
+        name = st.secrets.get("MONGODB_DB")
+    except Exception:
+        pass
+    return client[name or os.environ.get("MONGODB_DB") or "bank_reconciliation"]
+
+def _fs():
+    db = _mongo_db()
+    if db is None:
+        return None
+    import gridfs
+    return gridfs.GridFS(db)
+
+def restore_from_mongo():
+    """Return disabled | local | restored | empty | error. Restores only if the local file is missing."""
+    try:
+        fs = _fs()
+        if fs is None:
+            return "disabled"
+        SYNC_STATE["enabled"] = True
+        if DB_PATH.exists():
+            return "local"
+        f = fs.find_one({"filename": "reconciliation.db"}, sort=[("uploadDate", -1)])
+        if f is None:
+            return "empty"
+        DB_PATH.write_bytes(f.read())
+        return "restored"
+    except Exception as e:
+        SYNC_STATE["last_error"] = str(e)
+        return "error"
+
+def push_to_mongo():
+    """Copy a consistent snapshot of the local database to MongoDB; keeps the latest 5 versions."""
+    if not SYNC_STATE["enabled"] or not DB_PATH.exists():
+        return
+    with _sync_lock():
+        tmp = None
+        try:
+            fs = _fs()
+            t = tempfile.NamedTemporaryFile(delete=False, suffix=".db"); t.close(); tmp = t.name
+            src = sqlite3.connect(DB_PATH); dst = sqlite3.connect(tmp)
+            src.backup(dst); dst.close(); src.close()
+            fs.put(Path(tmp).read_bytes(), filename="reconciliation.db")
+            versions = list(fs.find({"filename": "reconciliation.db"}, sort=[("uploadDate", -1)]))
+            for old in versions[5:]:
+                fs.delete(old._id)
+            SYNC_STATE["last_error"] = None
+        except Exception as e:
+            SYNC_STATE["last_error"] = str(e)
+        finally:
+            if tmp and os.path.exists(tmp):
+                try: os.unlink(tmp)
+                except Exception: pass
+
+class SyncConn(sqlite3.Connection):
+    """Pushes the database to MongoDB after any block that committed changes."""
+    def __exit__(self, exc_type, exc, tb):
+        result = super().__exit__(exc_type, exc, tb)
+        if exc_type is None and self.total_changes > 0:
+            push_to_mongo()
+        return result
+
 def connect():
-    c = sqlite3.connect(DB_PATH, check_same_thread=False)
+    c = sqlite3.connect(DB_PATH, check_same_thread=False, factory=SyncConn)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
     return c
@@ -380,7 +468,14 @@ def make_pdf(title, lines, table_data):
       ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#EEF2F7")])]))
     story.append(t); doc.build(story); bio.seek(0); return bio.getvalue()
 
+_sync_status = restore_from_mongo()
+if _sync_status == "error":
+    st.error("Could not reach MongoDB, so the app has stopped to protect your data. "
+             f"Check MONGODB_URI and the Atlas network access list. Details: {SYNC_STATE['last_error']}")
+    st.stop()
 init_db()
+if SYNC_STATE["enabled"] and not st.session_state.get("_mongo_synced"):
+    push_to_mongo(); st.session_state["_mongo_synced"]=True
 
 # Login gate
 if "user" not in st.session_state:
@@ -405,6 +500,10 @@ USER=st.session_state.user
 role=USER["role"]
 st.sidebar.title("🏦 Reconciliation Pro")
 st.sidebar.write(f"**{USER['username']}** · {role}")
+if SYNC_STATE["enabled"]:
+    if SYNC_STATE["last_error"]: st.sidebar.warning("MongoDB sync failed: "+SYNC_STATE["last_error"][:150])
+    else: st.sidebar.caption("☁️ MongoDB sync: ON")
+else: st.sidebar.caption("⚠️ MongoDB not configured: data is temporary")
 co=company_options()
 if co.empty: st.error("Create a company first."); st.stop()
 company_name=st.sidebar.selectbox("Company",co.name.tolist())
@@ -879,6 +978,7 @@ with tabs[8]:
                 test=sqlite3.connect(tmp); test.execute("PRAGMA integrity_check"); test.close()
                 shutil.copy2(DB_PATH,DB_PATH.with_suffix(".pre_restore.bak")) if DB_PATH.exists() else None
                 DB_PATH.write_bytes(payload); tmp.unlink(missing_ok=True)
+                push_to_mongo()
                 st.success("Database restored. Sign in again."); st.session_state.clear(); st.rerun()
             except Exception as e: st.error(f"Restore failed: {e}")
     else: st.info("Only administrators can back up or restore the database.")
