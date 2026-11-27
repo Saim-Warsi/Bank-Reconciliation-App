@@ -1064,40 +1064,68 @@ with tabs[6]:
                      use_container_width=True, hide_index=True)
         if not view_df.empty:
             selected_id = st.selectbox("Select transaction to edit or delete",
-                                       view_df.id.astype(int).tolist(), key="crud_txn_id")
-            selected_row = manage_df[manage_df.id == selected_id].iloc[0]
-            st.markdown(f"**Selected:** #{selected_id} · {selected_row.source} · {selected_row.status}")
-            if selected_row.status == "Matched":
-                st.warning("This transaction belongs to a match group. Undo that group in Manual Match & Adjustments before editing or deleting.")
-            with st.form("edit_transaction_form"):
-                edit_date = st.date_input("Transaction date", value=pd.to_datetime(selected_row.txn_date).date())
-                edit_desc = st.text_input("Description", value=str(selected_row.description or ""))
-                edit_ref = st.text_input("Reference", value=str(selected_row.reference or ""))
-                edit_debit = st.number_input("Debit", min_value=0.0, value=float(selected_row.debit or 0), format="%.2f")
-                edit_credit = st.number_input("Credit", min_value=0.0, value=float(selected_row.credit or 0), format="%.2f")
-                save_txn = st.form_submit_button("Save transaction changes",
-                                                 disabled=(role == "Viewer" or selected_row.status == "Matched"))
-            if save_txn:
-                try:
-                    update_transaction(selected_id, edit_date, edit_desc, edit_ref,
-                                       edit_debit, edit_credit, USER["username"])
-                    st.success("Transaction updated.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
-            with st.form("delete_transaction_form"):
-                confirm_delete = st.checkbox(f"Permanently delete transaction #{selected_id} (cannot be undone)")
-                delete_txn = st.form_submit_button("Delete permanently",
-                                                   disabled=(role == "Viewer" or selected_row.status == "Matched"))
-            if delete_txn and confirm_delete:
-                try:
-                    delete_transaction(selected_id, USER["username"])
-                    st.session_state["flash"] = f"Transaction #{selected_id} permanently deleted."
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
-            elif delete_txn:
-                st.warning("Tick the confirmation box to delete.")
+                                       [0] + view_df.id.astype(int).tolist(), key="crud_txn_id",
+                                       format_func=lambda x: "All — clear every transaction in this account" if x == 0 else str(x))
+            if selected_id == 0:
+                st.caption("Applies to every transaction of this account, ignoring the filters above, "
+                           "including matched entries and adjustments.")
+                clear_runs = st.checkbox("Also delete the saved BRS runs for this account", key="clear_all_runs")
+                clear_plan = delete_imported_data(company_id, account_id, USER["username"], everything=True,
+                                                  delete_runs=clear_runs, dry_run=True)
+                st.warning("\n\n".join(plan_lines(clear_plan)))
+                if role == "Viewer":
+                    st.info("View-only access.")
+                else:
+                    with st.form("clear_all_form", clear_on_submit=True):
+                        typed_clear = st.text_input("Type DELETE to confirm")
+                        go_clear = st.form_submit_button("Delete everything permanently", type="primary")
+                    if go_clear:
+                        if typed_clear.strip() != "DELETE":
+                            st.error("Type DELETE (capital letters) to confirm.")
+                        else:
+                            try:
+                                p = delete_imported_data(company_id, account_id, USER["username"],
+                                                         everything=True, delete_runs=clear_runs)
+                                for k in ("brs_summary", "brs_period", "brs_rows"):
+                                    st.session_state.pop(k, None)
+                                st.session_state["flash"] = f"{p['deleted']} transaction(s) permanently deleted."
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
+            else:
+                selected_row = manage_df[manage_df.id == selected_id].iloc[0]
+                st.markdown(f"**Selected:** #{selected_id} · {selected_row.source} · {selected_row.status}")
+                if selected_row.status == "Matched":
+                    st.warning("This transaction belongs to a match group. Undo that group in Manual Match & Adjustments before editing or deleting.")
+                with st.form("edit_transaction_form"):
+                    edit_date = st.date_input("Transaction date", value=pd.to_datetime(selected_row.txn_date).date())
+                    edit_desc = st.text_input("Description", value=str(selected_row.description or ""))
+                    edit_ref = st.text_input("Reference", value=str(selected_row.reference or ""))
+                    edit_debit = st.number_input("Debit", min_value=0.0, value=float(selected_row.debit or 0), format="%.2f")
+                    edit_credit = st.number_input("Credit", min_value=0.0, value=float(selected_row.credit or 0), format="%.2f")
+                    save_txn = st.form_submit_button("Save transaction changes",
+                                                     disabled=(role == "Viewer" or selected_row.status == "Matched"))
+                if save_txn:
+                    try:
+                        update_transaction(selected_id, edit_date, edit_desc, edit_ref,
+                                           edit_debit, edit_credit, USER["username"])
+                        st.success("Transaction updated.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+                with st.form("delete_transaction_form"):
+                    confirm_delete = st.checkbox(f"Permanently delete transaction #{selected_id} (cannot be undone)")
+                    delete_txn = st.form_submit_button("Delete permanently",
+                                                       disabled=(role == "Viewer" or selected_row.status == "Matched"))
+                if delete_txn and confirm_delete:
+                    try:
+                        delete_transaction(selected_id, USER["username"])
+                        st.session_state["flash"] = f"Transaction #{selected_id} permanently deleted."
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+                elif delete_txn:
+                    st.warning("Tick the confirmation box to delete.")
 
     st.divider()
     st.subheader("Reconciliation draft management")
