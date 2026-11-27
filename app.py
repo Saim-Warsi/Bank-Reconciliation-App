@@ -126,12 +126,11 @@ def init_db():
           created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS companies(
           id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, currency TEXT NOT NULL DEFAULT 'PKR',
-          created_at TEXT NOT NULL, deleted_at TEXT DEFAULT NULL);
+          created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS accounts(
           id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL, bank_name TEXT NOT NULL,
           account_title TEXT NOT NULL, account_number TEXT NOT NULL, gl_code TEXT DEFAULT '',
           opening_bank REAL DEFAULT 0, opening_book REAL DEFAULT 0, active INTEGER DEFAULT 1,
-          deleted_at TEXT DEFAULT NULL,
           FOREIGN KEY(company_id) REFERENCES companies(id));
         CREATE TABLE IF NOT EXISTS transactions(
           id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
@@ -139,14 +138,14 @@ def init_db():
           txn_date TEXT NOT NULL, description TEXT DEFAULT '', reference TEXT DEFAULT '',
           debit REAL DEFAULT 0, credit REAL DEFAULT 0, amount REAL NOT NULL,
           fingerprint TEXT, match_group TEXT, status TEXT DEFAULT 'Unmatched',
-          source_file TEXT DEFAULT '', imported_at TEXT NOT NULL, deleted_at TEXT DEFAULT NULL,
+          source_file TEXT DEFAULT '', imported_at TEXT NOT NULL,
           FOREIGN KEY(company_id) REFERENCES companies(id),
           FOREIGN KEY(account_id) REFERENCES accounts(id));
         CREATE UNIQUE INDEX IF NOT EXISTS ux_txn_fingerprint ON transactions(fingerprint) WHERE fingerprint IS NOT NULL;
         CREATE TABLE IF NOT EXISTS reconciliation_runs(
           id INTEGER PRIMARY KEY, company_id INTEGER, account_id INTEGER, period_start TEXT,
           period_end TEXT, bank_closing REAL, book_closing REAL, brs_adjusted REAL,
-          status TEXT DEFAULT 'Draft', created_by TEXT, created_at TEXT, deleted_at TEXT DEFAULT NULL,
+          status TEXT DEFAULT 'Draft', created_by TEXT, created_at TEXT,
           updated_at TEXT DEFAULT NULL, updated_by TEXT DEFAULT NULL);
         CREATE TABLE IF NOT EXISTS audit_log(
           id INTEGER PRIMARY KEY, username TEXT, action TEXT, detail TEXT, created_at TEXT);
@@ -154,11 +153,7 @@ def init_db():
 
         # Backward-compatible migrations for existing databases.
         migrations = {
-            "companies": {"deleted_at": "TEXT DEFAULT NULL"},
-            "accounts": {"deleted_at": "TEXT DEFAULT NULL"},
-            "transactions": {"deleted_at": "TEXT DEFAULT NULL"},
             "reconciliation_runs": {
-                "deleted_at": "TEXT DEFAULT NULL",
                 "updated_at": "TEXT DEFAULT NULL",
                 "updated_by": "TEXT DEFAULT NULL",
             },
@@ -168,6 +163,28 @@ def init_db():
             for column, definition in wanted.items():
                 if column not in existing:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+        # The Recycle Bin has been removed. Anything still flagged as deleted in an older
+        # database is purged permanently, then the unused column is dropped.
+        def _has_deleted_at(table):
+            return any(r["name"] == "deleted_at" for r in c.execute(f"PRAGMA table_info({table})").fetchall())
+        if _has_deleted_at("accounts"):
+            c.execute("DELETE FROM transactions WHERE account_id IN (SELECT id FROM accounts WHERE deleted_at IS NOT NULL)")
+            c.execute("DELETE FROM reconciliation_runs WHERE account_id IN (SELECT id FROM accounts WHERE deleted_at IS NOT NULL)")
+            c.execute("DELETE FROM accounts WHERE deleted_at IS NOT NULL")
+        if _has_deleted_at("companies"):
+            for t in ("transactions", "reconciliation_runs", "accounts"):
+                c.execute(f"DELETE FROM {t} WHERE company_id IN (SELECT id FROM companies WHERE deleted_at IS NOT NULL)")
+            c.execute("DELETE FROM companies WHERE deleted_at IS NOT NULL")
+        for t in ("transactions", "reconciliation_runs"):
+            if _has_deleted_at(t):
+                c.execute(f"DELETE FROM {t} WHERE deleted_at IS NOT NULL")
+        for t in ("transactions", "reconciliation_runs", "accounts", "companies"):
+            if _has_deleted_at(t):
+                try:
+                    c.execute(f"ALTER TABLE {t} DROP COLUMN deleted_at")
+                except sqlite3.OperationalError:
+                    pass   # very old SQLite: the column stays but is never read
 
         # Automatically upgrade older databases
         columns = [
@@ -198,12 +215,12 @@ def qdf(sql, params=()):
 
 def company_options():
     d = qdf(
-        "SELECT id, name, currency FROM companies WHERE deleted_at IS NULL ORDER BY name"
+        "SELECT id, name, currency FROM companies ORDER BY name"
     )
     return d
 
 def account_options(company_id):
-    return qdf("SELECT * FROM accounts WHERE company_id=? AND active=1 AND deleted_at IS NULL ORDER BY bank_name,account_title", (int(company_id),))
+    return qdf("SELECT * FROM accounts WHERE company_id=? AND active=1 ORDER BY bank_name,account_title", (int(company_id),))
 
 def money(v, currency="PKR"):
     return f"{currency} {float(v or 0):,.2f}"
@@ -273,7 +290,7 @@ def import_transactions(d, company_id, account_id, source, filename, username):
     return count
 
 def transactions(company_id, account_id):
-    return qdf("SELECT * FROM transactions WHERE company_id=? AND account_id=? AND deleted_at IS NULL ORDER BY txn_date,id",(company_id,account_id))
+    return qdf("SELECT * FROM transactions WHERE company_id=? AND account_id=? ORDER BY txn_date,id",(company_id,account_id))
 
 
 def update_transaction(txn_id, txn_date, description, reference, debit, credit, username):
@@ -283,7 +300,7 @@ def update_transaction(txn_id, txn_date, description, reference, debit, credit, 
     amount = credit - debit
     with connect() as c:
         row = c.execute(
-            "SELECT * FROM transactions WHERE id=? AND deleted_at IS NULL", (int(txn_id),)
+            "SELECT * FROM transactions WHERE id=?", (int(txn_id),)
         ).fetchone()
         if not row:
             raise ValueError("Transaction not found.")
@@ -298,34 +315,25 @@ def update_transaction(txn_id, txn_date, description, reference, debit, credit, 
     audit(username, "UPDATE TRANSACTION",
           f"Transaction #{txn_id}; date={txn_date}; description={description}; reference={reference}; debit={debit}; credit={credit}")
 
-def soft_delete_transaction(txn_id, username):
+def delete_transaction(txn_id, username):
+    """Permanently delete one unmatched transaction."""
     with connect() as c:
-        row = c.execute(
-            "SELECT id, status, match_group FROM transactions WHERE id=? AND deleted_at IS NULL",
-            (int(txn_id),)
-        ).fetchone()
+        row = c.execute("SELECT id, source, txn_date, description, amount, status FROM transactions WHERE id=?",
+                        (int(txn_id),)).fetchone()
         if not row:
             raise ValueError("Transaction not found.")
         if row["status"] == "Matched":
             raise ValueError("Undo the match group before deleting this transaction.")
-        c.execute("UPDATE transactions SET deleted_at=? WHERE id=?",
-                  (datetime.now().isoformat(timespec="seconds"), int(txn_id)))
-    audit(username, "TRASH TRANSACTION", f"Transaction #{txn_id} moved to Recycle Bin.")
-
-def restore_transaction(txn_id, username):
-    with connect() as c:
-        row = c.execute("SELECT id FROM transactions WHERE id=? AND deleted_at IS NOT NULL",
-                        (int(txn_id),)).fetchone()
-        if not row:
-            raise ValueError("Deleted transaction not found.")
-        c.execute("UPDATE transactions SET deleted_at=NULL WHERE id=?", (int(txn_id),))
-    audit(username, "RESTORE TRANSACTION", f"Transaction #{txn_id} restored.")
+        c.execute("DELETE FROM transactions WHERE id=?", (int(txn_id),))
+    audit(username, "DELETE TRANSACTION",
+          f"Transaction #{txn_id} permanently deleted ({row['source']}; {row['txn_date']}; "
+          f"{row['description']}; {row['amount']:,.2f}).")
 
 def update_brs(run_id, period_start, period_end, bank_closing, book_closing, username):
     if period_start > period_end:
         raise ValueError("Period start must not be after period end.")
     with connect() as c:
-        row = c.execute("SELECT status FROM reconciliation_runs WHERE id=? AND deleted_at IS NULL",
+        row = c.execute("SELECT status FROM reconciliation_runs WHERE id=?",
                         (int(run_id),)).fetchone()
         if not row:
             raise ValueError("Reconciliation run not found.")
@@ -335,7 +343,7 @@ def update_brs(run_id, period_start, period_end, bank_closing, book_closing, use
             "SELECT company_id, account_id FROM reconciliation_runs WHERE id=?", (int(run_id),)
         ).fetchone()
         txns = c.execute("""SELECT source, amount FROM transactions
-                            WHERE company_id=? AND account_id=? AND deleted_at IS NULL
+                            WHERE company_id=? AND account_id=?
                               AND status='Unmatched' AND txn_date BETWEEN ? AND ?""",
                          (run_account["company_id"], run_account["account_id"],
                           period_start.isoformat(), period_end.isoformat())).fetchall()
@@ -351,17 +359,145 @@ def update_brs(run_id, period_start, period_end, bank_closing, book_closing, use
                    username, int(run_id)))
     audit(username, "UPDATE BRS DRAFT", f"Reconciliation run #{run_id} updated.")
 
-def soft_delete_brs(run_id, username):
+def delete_brs_run(run_id, username):
+    """Permanently delete a Draft reconciliation run."""
     with connect() as c:
-        row = c.execute("SELECT status FROM reconciliation_runs WHERE id=? AND deleted_at IS NULL",
-                        (int(run_id),)).fetchone()
+        row = c.execute("SELECT status FROM reconciliation_runs WHERE id=?", (int(run_id),)).fetchone()
         if not row:
             raise ValueError("Reconciliation run not found.")
         if row["status"] != "Draft":
-            raise ValueError("Only Draft reconciliation runs can be moved to the Recycle Bin.")
-        c.execute("UPDATE reconciliation_runs SET deleted_at=? WHERE id=?",
-                  (datetime.now().isoformat(timespec="seconds"), int(run_id)))
-    audit(username, "TRASH BRS DRAFT", f"Reconciliation run #{run_id} moved to Recycle Bin.")
+            raise ValueError("Only Draft reconciliation runs can be deleted.")
+        c.execute("DELETE FROM reconciliation_runs WHERE id=?", (int(run_id),))
+    audit(username, "DELETE BRS DRAFT", f"Reconciliation run #{run_id} permanently deleted.")
+
+def import_batches(company_id, account_id):
+    """One row per imported file (Bank / Books) for the selected account."""
+    return qdf("""SELECT source, COALESCE(source_file,'') AS source_file, COUNT(*) AS row_count,
+                         COALESCE(SUM(status='Matched'),0) AS matched_rows, MIN(imported_at) AS imported_at
+                  FROM transactions
+                  WHERE company_id=? AND account_id=? AND source IN ('Bank','Books')
+                  GROUP BY source, COALESCE(source_file,'')
+                  ORDER BY MIN(imported_at) DESC""", (int(company_id), int(account_id)))
+
+def delete_imported_data(company_id, account_id, username, sources=("Bank", "Books"), source_file=None,
+                         everything=False, delete_runs=False, dry_run=False):
+    """Permanently delete imported data for one account so reconciliation can start again.
+
+    sources      which imports to remove ('Bank', 'Books').
+    source_file  limit the deletion to one imported file ('' = rows with no file name; None = all files).
+    everything   remove every transaction of the account: imports, adjustments and matches.
+    delete_runs  also remove the saved BRS runs of the account.
+    dry_run      only report what would happen.
+
+    Partly deleting data dissolves the match groups that contained deleted rows; the surviving
+    rows return to Unmatched. Deleted fingerprints are freed, so the same file can be imported again.
+    """
+    cid, aid = int(company_id), int(account_id)
+    where, params = "company_id=? AND account_id=?", [cid, aid]
+    if not everything:
+        where += f" AND source IN ({','.join('?' * len(sources))})"
+        params += list(sources)
+        if source_file is not None:
+            where += " AND COALESCE(source_file,'')=?"
+            params.append(source_file)
+    # rows that stay behind but belong to a match group that loses a member
+    released_where = (f"company_id=? AND account_id=? AND NOT ({where}) AND match_group IN "
+                      f"(SELECT match_group FROM transactions WHERE {where} AND match_group IS NOT NULL)")
+    released_params = [cid, aid] + params + params
+    with connect() as c:
+        total, matched = c.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(status='Matched'),0) FROM transactions WHERE {where}", params).fetchone()
+        groups = c.execute(
+            f"SELECT COUNT(DISTINCT match_group) FROM transactions WHERE {where} AND match_group IS NOT NULL",
+            params).fetchone()[0]
+        released = adjustments = 0
+        if not everything:
+            released = c.execute(f"SELECT COUNT(*) FROM transactions WHERE {released_where}",
+                                 released_params).fetchone()[0]
+            adjustments = c.execute(f"SELECT COUNT(*) FROM transactions WHERE {released_where} AND source='Adjustment'",
+                                    released_params).fetchone()[0]
+        runs = 0
+        if delete_runs:
+            runs = c.execute("SELECT COUNT(*) FROM reconciliation_runs WHERE company_id=? AND account_id=?",
+                             (cid, aid)).fetchone()[0]
+        plan = {"deleted": total, "matched_deleted": matched, "groups": groups,
+                "released": released, "adjustments": adjustments, "runs": runs}
+        if dry_run:
+            return plan
+        if released:
+            c.execute(f"UPDATE transactions SET status='Unmatched', match_group=NULL WHERE {released_where}",
+                      released_params)
+        c.execute(f"DELETE FROM transactions WHERE {where}", params)
+        if delete_runs:
+            c.execute("DELETE FROM reconciliation_runs WHERE company_id=? AND account_id=?", (cid, aid))
+    scope = "ALL data" if everything else "/".join(sources) + (f" file '{source_file}'" if source_file is not None else " imports")
+    audit(username, "DELETE IMPORTED DATA",
+          f"{scope}; company={cid}; account={aid}; {plan['deleted']} transactions deleted; "
+          f"{plan['groups']} match groups affected; {plan['released']} entries returned to Unmatched; "
+          f"{plan['runs']} BRS runs deleted.")
+    return plan
+
+def delete_account(account_id, username):
+    """Permanently delete a bank account with its transactions and BRS runs."""
+    with connect() as c:
+        acc = c.execute("SELECT * FROM accounts WHERE id=?", (int(account_id),)).fetchone()
+        if not acc:
+            raise ValueError("Bank account not found.")
+        if acc["active"]:
+            others = c.execute("SELECT COUNT(*) FROM accounts WHERE company_id=? AND active=1 AND id<>?",
+                               (acc["company_id"], int(account_id))).fetchone()[0]
+            if others == 0:
+                raise ValueError("This is the company's only active bank account. Add or activate another "
+                                 "account first, or delete the whole company.")
+        n = c.execute("DELETE FROM transactions WHERE account_id=?", (int(account_id),)).rowcount
+        r = c.execute("DELETE FROM reconciliation_runs WHERE account_id=?", (int(account_id),)).rowcount
+        c.execute("DELETE FROM accounts WHERE id=?", (int(account_id),))
+    audit(username, "DELETE BANK ACCOUNT",
+          f"Account #{account_id} ({acc['bank_name']} {acc['account_title']}) permanently deleted with {n} transactions and {r} BRS runs.")
+
+def delete_company(company_id, username):
+    """Permanently delete a company with its accounts, transactions and BRS runs."""
+    with connect() as c:
+        comp = c.execute("SELECT * FROM companies WHERE id=?", (int(company_id),)).fetchone()
+        if not comp:
+            raise ValueError("Company not found.")
+        if c.execute("SELECT COUNT(*) FROM companies").fetchone()[0] <= 1:
+            raise ValueError("You cannot delete the only company. Create another company first.")
+        n = c.execute("DELETE FROM transactions WHERE company_id=?", (int(company_id),)).rowcount
+        r = c.execute("DELETE FROM reconciliation_runs WHERE company_id=?", (int(company_id),)).rowcount
+        a = c.execute("DELETE FROM accounts WHERE company_id=?", (int(company_id),)).rowcount
+        c.execute("DELETE FROM companies WHERE id=?", (int(company_id),))
+    audit(username, "DELETE COMPANY",
+          f"Company #{company_id} ({comp['name']}) permanently deleted with {a} accounts, {n} transactions and {r} BRS runs.")
+
+def delete_user(target, acting_user):
+    """Permanently delete a user account (the audit history keeps the username)."""
+    if target == acting_user:
+        raise ValueError("You cannot delete the account you are signed in with.")
+    with connect() as c:
+        row = c.execute("SELECT role FROM users WHERE username=?", (target,)).fetchone()
+        if not row:
+            raise ValueError("User not found.")
+        if row["role"] == "Admin":
+            left = c.execute("SELECT COUNT(*) FROM users WHERE role='Admin' AND active=1 AND username<>?",
+                             (target,)).fetchone()[0]
+            if left == 0:
+                raise ValueError("At least one active Admin must remain.")
+        c.execute("DELETE FROM users WHERE username=?", (target,))
+    audit(acting_user, "DELETE USER", f"User {target} permanently deleted.")
+
+def plan_lines(p):
+    lines = [f"**{p['deleted']}** transaction(s) will be permanently deleted."]
+    if p["matched_deleted"]:
+        lines.append(f"{p['matched_deleted']} of them are matched; {p['groups']} match group(s) will be affected.")
+    if p["released"]:
+        lines.append(f"{p['released']} remaining entr{'y' if p['released'] == 1 else 'ies'} from those groups will return to Unmatched.")
+    if p["adjustments"]:
+        lines.append(f"{p['adjustments']} of those are Adjustment entries. They are kept (as Unmatched); "
+                     "remove them in Data Management if you no longer need them.")
+    if p["runs"]:
+        lines.append(f"{p['runs']} saved BRS run(s) will be deleted.")
+    return lines
 
 def match_group(ids, username, label="Manual match", balancing=None):
     """Match bank and book entries that offset to zero.
@@ -512,6 +648,7 @@ else:
 st.sidebar.button("Log out",on_click=lambda: st.session_state.pop("user",None))
 st.title("Bank Reconciliation Pro")
 st.caption("Multi-company • Multi-bank • Split/combined matching • Formal BRS • Audit trail")
+if "flash" in st.session_state: st.success(st.session_state.pop("flash"))
 if ac.empty: st.stop()
 tabs=st.tabs(["Dashboard","Companies & Accounts","Import","Reconciliation","Manual Match & Adjustments","BRS & Reports","Data Management","Users & Audit","Backup & Restore"])
 
@@ -592,7 +729,7 @@ with tabs[1]:
                     st.error("That company name is already in use.")
 
         st.subheader("Edit bank account")
-        all_accounts = qdf("SELECT * FROM accounts WHERE company_id=? AND deleted_at IS NULL ORDER BY id",
+        all_accounts = qdf("SELECT * FROM accounts WHERE company_id=? ORDER BY id",
                            (company_id,))
         if not all_accounts.empty:
             account_choice = st.selectbox("Account to edit",
@@ -619,6 +756,48 @@ with tabs[1]:
                 st.success("Bank account updated.")
                 st.rerun()
 
+        st.divider()
+        st.subheader("Delete bank account")
+        st.caption("Permanently deletes the account together with all of its transactions and BRS runs. This cannot be undone.")
+        if all_accounts.empty:
+            st.info("This company has no bank accounts.")
+        else:
+            del_acc_labels = all_accounts.apply(lambda r: f"#{r.id} · {r.bank_name} — {r.account_title}", axis=1).tolist()
+            del_acc_pick = st.selectbox("Account to delete", del_acc_labels, key="del_account_pick")
+            del_acc_id = int(all_accounts.iloc[del_acc_labels.index(del_acc_pick)].id)
+            with st.form("delete_account_form", clear_on_submit=True):
+                typed_acc = st.text_input("Type DELETE to confirm")
+                go_del_acc = st.form_submit_button("Delete bank account permanently")
+            if go_del_acc:
+                if typed_acc.strip() != "DELETE":
+                    st.error("Type DELETE (capital letters) to confirm.")
+                else:
+                    try:
+                        delete_account(del_acc_id, USER["username"])
+                        st.session_state["flash"] = "Bank account permanently deleted."
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+        st.subheader("Delete company")
+        st.caption("Permanently deletes the company with all of its bank accounts, transactions and BRS runs. This cannot be undone.")
+        del_comp_df = company_options()
+        del_comp_name = st.selectbox("Company to delete", del_comp_df.name.tolist(), key="del_company_pick")
+        del_comp_id = int(del_comp_df.loc[del_comp_df.name == del_comp_name, "id"].iloc[0])
+        with st.form("delete_company_form", clear_on_submit=True):
+            typed_comp = st.text_input("Type the company name to confirm")
+            go_del_comp = st.form_submit_button("Delete company permanently")
+        if go_del_comp:
+            if typed_comp.strip() != del_comp_name:
+                st.error("The name you typed does not match the company name.")
+            else:
+                try:
+                    delete_company(del_comp_id, USER["username"])
+                    st.session_state["flash"] = f"Company '{del_comp_name}' permanently deleted."
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
 with tabs[2]:
     st.subheader("Import statements")
     f1,f2=st.columns(2)
@@ -634,6 +813,77 @@ with tabs[2]:
                 except Exception as e: st.error(str(e))
     with st.expander("Expected input columns"):
         st.write("Date is mandatory. Description/Narration and Reference/Cheque No. are recommended. Supply either signed Amount (credits positive, debits negative) or Debit and Credit columns. Dates are interpreted day-first.")
+
+    st.divider()
+    st.subheader("Imported data")
+    batches = import_batches(company_id, account_id)
+    if batches.empty:
+        st.info("Nothing has been imported for this account.")
+    else:
+        st.dataframe(batches.rename(columns={"source": "Source", "source_file": "File", "row_count": "Rows",
+                                             "matched_rows": "Matched rows", "imported_at": "First imported"}),
+                     use_container_width=True, hide_index=True)
+    if role == "Viewer":
+        st.info("Your role cannot delete imported data.")
+    else:
+        st.caption("Deletions are permanent. Download a backup first if you may need the data again (Backup & Restore tab).")
+        with st.expander("Delete one imported file"):
+            if batches.empty:
+                st.info("No imported files to delete.")
+            else:
+                batch_labels = batches.apply(
+                    lambda r: f"{r.source} · {r.source_file or '(no file name)'} · {int(r.row_count)} rows", axis=1).tolist()
+                batch_pick = st.selectbox("Imported file", batch_labels, key="del_batch_pick")
+                batch_row = batches.iloc[batch_labels.index(batch_pick)]
+                batch_plan = delete_imported_data(company_id, account_id, USER["username"], sources=[batch_row.source],
+                                                  source_file=batch_row.source_file, dry_run=True)
+                st.warning("\n\n".join(plan_lines(batch_plan)))
+                with st.form("del_batch_form", clear_on_submit=True):
+                    ok_batch = st.checkbox("I understand this cannot be undone")
+                    go_batch = st.form_submit_button("Delete this import permanently")
+                if go_batch:
+                    if not ok_batch:
+                        st.error("Tick the confirmation box first.")
+                    else:
+                        try:
+                            p = delete_imported_data(company_id, account_id, USER["username"],
+                                                     sources=[batch_row.source], source_file=batch_row.source_file)
+                            st.session_state["flash"] = f"{p['deleted']} transaction(s) deleted. You can import the file again."
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
+
+        with st.expander("Start reconciliation from the beginning"):
+            st.write("Remove imported data for this account so you can import fresh statements and reconcile again.")
+            reset_scope = st.radio("What should be deleted?", [
+                "Bank statement imports only",
+                "Books / ledger imports only",
+                "Everything for this account (bank, books, adjustments and all matches)"], key="reset_scope")
+            reset_runs = st.checkbox("Also delete the saved BRS runs for this account", key="reset_runs")
+            reset_everything = reset_scope.startswith("Everything")
+            reset_sources = ["Bank"] if reset_scope.startswith("Bank") else ["Books"]
+            reset_plan = delete_imported_data(company_id, account_id, USER["username"], sources=reset_sources,
+                                              everything=reset_everything, delete_runs=reset_runs, dry_run=True)
+            if reset_plan["deleted"] == 0 and reset_plan["runs"] == 0:
+                st.info("Nothing to delete for this selection.")
+            else:
+                st.warning("\n\n".join(plan_lines(reset_plan)))
+                with st.form("reset_form", clear_on_submit=True):
+                    typed_reset = st.text_input("Type DELETE to confirm")
+                    go_reset = st.form_submit_button("Delete permanently", type="primary")
+                if go_reset:
+                    if typed_reset.strip() != "DELETE":
+                        st.error("Type DELETE (capital letters) to confirm.")
+                    else:
+                        try:
+                            p = delete_imported_data(company_id, account_id, USER["username"], sources=reset_sources,
+                                                     everything=reset_everything, delete_runs=reset_runs)
+                            for k in ("brs_summary", "brs_period", "brs_rows"):
+                                st.session_state.pop(k, None)
+                            st.session_state["flash"] = f"{p['deleted']} transaction(s) deleted. You can import fresh statements now."
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
 
 with tabs[3]:
     st.subheader("Automatic reconciliation")
@@ -788,12 +1038,12 @@ with tabs[5]:
         excel=make_excel(df,detail)
         st.download_button("Download Excel reconciliation workbook",excel,"bank_reconciliation_workbook.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.subheader("Previous BRS runs")
-    st.dataframe(qdf("SELECT id,period_start,period_end,bank_closing,book_closing,brs_adjusted,status,created_by,created_at FROM reconciliation_runs WHERE company_id=? AND account_id=? AND deleted_at IS NULL ORDER BY id DESC",(company_id,account_id)),use_container_width=True)
+    st.dataframe(qdf("SELECT id,period_start,period_end,bank_closing,book_closing,brs_adjusted,status,created_by,created_at FROM reconciliation_runs WHERE company_id=? AND account_id=? ORDER BY id DESC",(company_id,account_id)),use_container_width=True)
 
 
 with tabs[6]:
     st.subheader("Transaction management")
-    st.caption("Edit or move incorrect unmatched entries to the Recycle Bin. Matched entries must first be unmatched.")
+    st.caption("Edit or permanently delete incorrect unmatched entries. Matched entries must first be unmatched. Deletions cannot be undone.")
     manage_df = transactions(company_id, account_id)
     if manage_df.empty:
         st.info("There are no active transactions for this account.")
@@ -835,45 +1085,24 @@ with tabs[6]:
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
-            with st.form("trash_transaction_form"):
-                confirm_trash = st.checkbox(f"Move transaction #{selected_id} to Recycle Bin")
-                trash_txn = st.form_submit_button("Move to Recycle Bin",
-                                                  disabled=(role == "Viewer" or selected_row.status == "Matched"))
-            if trash_txn and confirm_trash:
+            with st.form("delete_transaction_form"):
+                confirm_delete = st.checkbox(f"Permanently delete transaction #{selected_id} (cannot be undone)")
+                delete_txn = st.form_submit_button("Delete permanently",
+                                                   disabled=(role == "Viewer" or selected_row.status == "Matched"))
+            if delete_txn and confirm_delete:
                 try:
-                    soft_delete_transaction(selected_id, USER["username"])
-                    st.success("Transaction moved to Recycle Bin.")
+                    delete_transaction(selected_id, USER["username"])
+                    st.session_state["flash"] = f"Transaction #{selected_id} permanently deleted."
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
-
-    st.divider()
-    st.subheader("Recycle Bin")
-    st.caption("Deleted transactions are retained in the database and can be restored by an Admin.")
-    if role == "Admin":
-        trash_df = qdf("""SELECT id,source,txn_date,description,reference,debit,credit,amount,deleted_at
-                          FROM transactions WHERE company_id=? AND account_id=? AND deleted_at IS NOT NULL
-                          ORDER BY deleted_at DESC""", (company_id, account_id))
-        if trash_df.empty:
-            st.info("Recycle Bin is empty for this account.")
-        else:
-            st.dataframe(trash_df, use_container_width=True, hide_index=True)
-            restore_id = st.selectbox("Select deleted transaction to restore",
-                                      trash_df.id.astype(int).tolist(), key="restore_txn_id")
-            if st.button("Restore selected transaction", type="primary"):
-                try:
-                    restore_transaction(restore_id, USER["username"])
-                    st.success("Transaction restored.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
-    else:
-        st.info("Only Admin users can restore deleted transactions.")
+            elif delete_txn:
+                st.warning("Tick the confirmation box to delete.")
 
     st.divider()
     st.subheader("Reconciliation draft management")
     runs = qdf("""SELECT id,period_start,period_end,bank_closing,book_closing,status,created_by,created_at
-                  FROM reconciliation_runs WHERE company_id=? AND account_id=? AND deleted_at IS NULL
+                  FROM reconciliation_runs WHERE company_id=? AND account_id=?
                   ORDER BY id DESC""", (company_id, account_id))
     st.dataframe(runs, use_container_width=True, hide_index=True)
     drafts = runs[runs.status == "Draft"] if not runs.empty else runs
@@ -893,16 +1122,18 @@ with tabs[6]:
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
-        with st.form("trash_brs_form"):
-            confirm_brs = st.checkbox(f"Move Draft BRS #{run_id} to Recycle Bin")
-            delete_brs = st.form_submit_button("Move Draft BRS to Recycle Bin")
-        if delete_brs and confirm_brs:
+        with st.form("delete_brs_form"):
+            confirm_brs = st.checkbox(f"Permanently delete Draft BRS #{run_id} (cannot be undone)")
+            delete_brs_btn = st.form_submit_button("Delete Draft BRS permanently")
+        if delete_brs_btn and confirm_brs:
             try:
-                soft_delete_brs(run_id, USER["username"])
-                st.success("Draft BRS moved to Recycle Bin.")
+                delete_brs_run(run_id, USER["username"])
+                st.session_state["flash"] = f"Draft BRS #{run_id} permanently deleted."
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
+        elif delete_brs_btn:
+            st.warning("Tick the confirmation box to delete.")
     elif role == "Viewer":
         st.info("View-only access.")
 
@@ -934,6 +1165,25 @@ with tabs[7]:
                 else:
                     with connect() as c: c.execute("UPDATE users SET role=?,active=? WHERE username=?",(new_role,int(active),target))
                     audit(USER["username"],"UPDATE USER",f"{target}; role={new_role}; active={active}"); st.success("User updated.")
+        st.markdown("**Delete user**")
+        deletable_users = users[users.username != USER["username"]].username.tolist()
+        if deletable_users:
+            del_user_pick = st.selectbox("User to delete", deletable_users, key="del_user_pick")
+            with st.form("delete_user_form", clear_on_submit=True):
+                ok_user = st.checkbox("I understand this permanently deletes the user account")
+                go_del_user = st.form_submit_button("Delete user permanently")
+            if go_del_user:
+                if not ok_user:
+                    st.error("Tick the confirmation box first.")
+                else:
+                    try:
+                        delete_user(del_user_pick, USER["username"])
+                        st.session_state["flash"] = f"User {del_user_pick} permanently deleted."
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+        else:
+            st.caption("There are no other users to delete.")
         st.markdown("**Reset your password**")
         with st.form("change_pw"):
             old=st.text_input("Current password",type="password")
